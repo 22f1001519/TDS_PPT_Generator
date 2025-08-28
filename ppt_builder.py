@@ -1,101 +1,66 @@
-import json
-import re
-from typing import Dict, List
+from typing import List, Dict, Optional
 
-import httpx
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_PARAGRAPH_ALIGNMENT
 
-from utils import fallback_plan_from_text, clamp_slides
+def _find_title_and_content_layout(prs: Presentation):
+    # Try to find a layout with at least 2 placeholders (title + body)
+    for layout in prs.slide_layouts:
+        if len(layout.placeholders) >= 2:
+            return layout
+    # Fallback to first layout
+    return prs.slide_layouts[0]
 
-# Optional SDKs (installed via requirements). Imported lazily.
-def _import_openai():
-    from openai import OpenAI
-    return OpenAI
+def _set_title(shape, text: str):
+    if not shape or not getattr(shape, "text_frame", None):
+        return
+    shape.text_frame.clear()
+    p = shape.text_frame.paragraphs[0]
+    p.text = text.strip()[:200]
 
-def _import_anthropic():
-    import anthropic
-    return anthropic
+def _fill_bullets(shape, bullets: List[str]):
+    if not shape or not getattr(shape, "text_frame", None):
+        return
+    tf = shape.text_frame
+    tf.clear()
+    first = True
+    for b in bullets:
+        if first:
+            p = tf.paragraphs[0]
+            first = False
+        else:
+            p = tf.add_paragraph()
+        p.text = b.strip()
+        p.level = 0
 
-def _import_gemini():
-    import google.generativeai as genai
-    return genai
+def _add_notes(slide, notes: Optional[str]):
+    if not notes:
+        return
+    notes_slide = slide.notes_slide
+    tf = notes_slide.notes_text_frame
+    tf.clear()
+    tf.text = notes.strip()[:2000]
 
-SYSTEM_PROMPT = """You are a slide architect. Convert the given text into a JSON plan for slides.
-Return ONLY valid JSON with this schema:
-{
-  "slides": [
-    {"title": "string", "bullets": ["string", ...], "notes": "string (optional)"}
-  ]
-}
-Bullets should be short, 3-6 per slide. At most 20 slides. Do not include code fences.
-"""
+def build_ppt(template_path: str, slides: List[Dict], output_path: str):
+    prs = Presentation(template_path)
+    layout = _find_title_and_content_layout(prs)
 
-def _prompt_for(text: str, guidance: str, gen_notes: bool) -> str:
-    parts = [f"GUIDANCE: {guidance.strip()}" if guidance else "GUIDANCE: (none)",
-             f"NOTES: {'yes' if gen_notes else 'no'}",
-             "TEXT:", text.strip()]
-    return "\n\n".join(parts)
+    for s in slides:
+        title = s.get("title", "").strip() or " "
+        bullets = s.get("bullets", []) or []
+        notes = s.get("notes", None)
 
-async def plan_slides_via_provider(text: str, guidance: str, provider: str, api_key: str, gen_notes: bool) -> Dict:
-    if provider == "none" or not api_key:
-        plan = fallback_plan_from_text(text, guidance, gen_notes=gen_notes)
-        return {"slides": clamp_slides(plan["slides"], max_slides=20)}
+        slide = prs.slides.add_slide(layout)
 
-    prompt = _prompt_for(text, guidance, gen_notes)
+        # Assume placeholder 0 is title, 1 is body (common in many templates)
+        title_shape = slide.shapes.title
+        body_shape = None
+        if len(slide.placeholders) > 1:
+            body_shape = slide.placeholders[1]
 
-    if provider == "openai":
-        OpenAI = _import_openai()
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content
-        return _coerce_to_plan(content)
+        _set_title(title_shape, title)
+        _fill_bullets(body_shape, bullets[:6])
+        _add_notes(slide, notes)
 
-    if provider == "anthropic":
-        anthropic = _import_anthropic()
-        client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=2000,
-            temperature=0.2,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        # Claude returns content as a list of blocks
-        content = "".join([b.text for b in msg.content if getattr(b, "type", None) == "text"])
-        return _coerce_to_plan(content)
-
-    if provider == "gemini":
-        genai = _import_gemini()
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        resp = model.generate_content([SYSTEM_PROMPT, prompt])
-        content = resp.text
-        return _coerce_to_plan(content)
-
-    # Unknown provider -> fallback
-    plan = fallback_plan_from_text(text, guidance, gen_notes=gen_notes)
-    return {"slides": clamp_slides(plan["slides"], max_slides=20)}
-
-def _coerce_to_plan(raw: str) -> Dict:
-    # Strip code fences if the model added them
-    cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE)
-    # Try to extract the first {...} JSON object
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if m:
-        cleaned = m.group(0)
-    data = json.loads(cleaned)
-    if "slides" not in data or not isinstance(data["slides"], list):
-        raise ValueError("LLM did not return a slides array")
-    return data
-
-def safe_parse_json(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
+    prs.save(output_path)
